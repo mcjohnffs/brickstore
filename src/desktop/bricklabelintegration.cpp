@@ -6,20 +6,21 @@
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QEvent>
+#include <QEventLoop>
 #include <QInputDialog>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QMessageBox>
-#include <QPageLayout>
-#include <QPageSize>
-#include <QPainter>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPointer>
-#include <QPrintDialog>
-#include <QPrinter>
-#include <QPrinterInfo>
 #include <QPushButton>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QTimer>
+#include <QUrl>
 
 #include "additemdialog.h"
 #include "selectcolor.h"
@@ -30,7 +31,8 @@
 
 namespace {
 
-constexpr auto LabelPrinterConfigKey = "MainWindow/AddItemDialog/DK11204Printer";
+constexpr auto LabelServiceConfigKey = "MainWindow/AddItemDialog/BrotherQLServiceUrl";
+constexpr auto DefaultLabelServiceUrl = "http://127.0.0.1:8013";
 
 QString currencyCode(AddItemDialog *dialog)
 {
@@ -43,72 +45,106 @@ QString currencyCode(AddItemDialog *dialog)
     return u"CHF"_qs;
 }
 
-void selectPreferredPrinter(QPrinter &printer)
+QString labelServiceUrl()
 {
-    const QString saved = Config::inst()->value(QString::fromLatin1(LabelPrinterConfigKey)).toString();
-    const auto printers = QPrinterInfo::availablePrinters();
-
-    if (!saved.isEmpty()) {
-        for (const auto &info : printers) {
-            if (info.printerName() == saved) {
-                printer.setPrinterName(saved);
-                return;
-            }
-        }
-    }
-
-    for (const auto &info : printers) {
-        if (info.printerName().contains(u"QL-810W"_qs, Qt::CaseInsensitive)
-                || info.printerName().contains(u"Brother QL-810"_qs, Qt::CaseInsensitive)) {
-            printer.setPrinterName(info.printerName());
-            return;
-        }
-    }
+    return Config::inst()->value(QString::fromLatin1(LabelServiceConfigKey),
+                                 QString::fromLatin1(DefaultLabelServiceUrl))
+        .toString().trimmed();
 }
 
-void drawLabel(QPainter &painter, QPrinter &printer,
-               const QString &itemId, const QString &itemName,
-               const QString &meta, const QString &price)
+bool configureLabelService(AddItemDialog *dialog)
 {
-    QRect page = printer.pageLayout().fullRectPixels(printer.resolution());
-    if (!page.isValid() || page.isEmpty())
-        page = painter.viewport();
+    bool ok = false;
+    QString value = QInputDialog::getText(
+        dialog,
+        QObject::tr("Brother QL label service"),
+        QObject::tr("Service URL:"),
+        QLineEdit::Normal,
+        labelServiceUrl(),
+        &ok);
+    if (!ok)
+        return false;
 
-    painter.save();
-    painter.setViewport(page);
-    painter.setWindow(0, 0, 540, 170);
-    painter.fillRect(QRect(0, 0, 540, 170), Qt::white);
-    painter.setPen(Qt::black);
+    value = value.trimmed();
+    while (value.endsWith(u'/'))
+        value.chop(1);
 
-    QFont font = painter.font();
-    font.setBold(true);
-    font.setPixelSize(37);
-    painter.setFont(font);
-    painter.drawText(QRect(14, 8, 260, 48), Qt::AlignLeft | Qt::AlignVCenter,
-                     itemId);
+    const QUrl url(value);
+    if (!url.isValid() || url.scheme().isEmpty() || url.host().isEmpty()) {
+        QMessageBox::warning(dialog,
+                             QObject::tr("Brother QL label service"),
+                             QObject::tr("Please enter a valid HTTP URL, for example http://127.0.0.1:8013."));
+        return false;
+    }
 
-    font.setPixelSize(35);
-    painter.setFont(font);
-    painter.drawText(QRect(270, 8, 256, 48), Qt::AlignRight | Qt::AlignVCenter,
-                     price);
+    Config::inst()->setValue(QString::fromLatin1(LabelServiceConfigKey), value);
+    return true;
+}
 
-    font.setBold(false);
-    font.setPixelSize(27);
-    painter.setFont(font);
-    QFontMetrics nameMetrics(font);
-    const QString shortName = nameMetrics.elidedText(itemName, Qt::ElideRight, 505);
-    painter.drawText(QRect(14, 59, 512, 43), Qt::AlignLeft | Qt::AlignVCenter,
-                     shortName);
+struct PrintResult
+{
+    bool ok = false;
+    QString error;
+};
 
-    font.setPixelSize(23);
-    painter.setFont(font);
-    QFontMetrics metaMetrics(font);
-    const QString shortMeta = metaMetrics.elidedText(meta, Qt::ElideRight, 505);
-    painter.drawText(QRect(14, 105, 512, 39), Qt::AlignLeft | Qt::AlignVCenter,
-                     shortMeta);
+PrintResult postLabel(const QJsonObject &payload)
+{
+    QString base = labelServiceUrl();
+    while (base.endsWith(u'/'))
+        base.chop(1);
 
-    painter.drawLine(14, 151, 526, 151);
-    painter.restore();
+    QNetworkAccessManager manager;
+    QNetworkRequest request(QUrl(base + u"/print"_qs));
+    request.setHeader(QNetworkRequest::ContentTypeHeader, u"application/json"_qs);
+
+    QNetworkReply *reply = manager.post(request, QJsonDocument(payload).toJson(QJsonDocument::Compact));
+    QEventLoop loop;
+    QTimer timeout;
+    timeout.setSingleShot(true);
+    timeout.setInterval(10000);
+
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+    QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
+    timeout.start();
+    loop.exec();
+
+    if (!timeout.isActive()) {
+        reply->abort();
+        return { false, QObject::tr("The label service did not respond within 10 seconds.") };
+    }
+    timeout.stop();
+
+    const QByteArray raw = reply->readAll();
+    if (reply->error() != QNetworkReply::NoError)
+        return { false, QObject::tr("%1\n%2").arg(reply->errorString(), QString::fromUtf8(raw)) };
+
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(raw, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+        return { false, QObject::tr("The label service returned an invalid response: %1")
+                           .arg(QString::fromUtf8(raw)) };
+
+    const QJsonObject obj = doc.object();
+    if (!obj.value(u"ok"_qs).toBool())
+        return { false, obj.value(u"error"_qs).toString(QObject::tr("Unknown printing error.")) };
+
+    return { true, { } };
+}
+
+void showServiceError(AddItemDialog *dialog, const QString &error)
+{
+    QMessageBox box(QMessageBox::Critical,
+                    QObject::tr("Print DK-11204 label"),
+                    QObject::tr("Brother QL printing failed.\n\nService: %1\n\n%2")
+                        .arg(labelServiceUrl(), error),
+                    QMessageBox::NoButton,
+                    dialog);
+    auto *changeButton = box.addButton(QObject::tr("Change service URL..."),
+                                       QMessageBox::ActionRole);
+    box.addButton(QMessageBox::Close);
+    box.exec();
+    if (box.clickedButton() == changeButton)
+        configureLabelService(dialog);
 }
 
 void printLabel(AddItemDialog *dialog)
@@ -122,60 +158,35 @@ void printLabel(AddItemDialog *dialog)
     const BrickLink::Color *color = colorSelector ? colorSelector->currentColor() : nullptr;
 
     if (!item || !priceSpin) {
-        QMessageBox::warning(dialog, QObject::tr("Print DK-11204 label"),
+        QMessageBox::warning(dialog,
+                             QObject::tr("Print DK-11204 label"),
                              QObject::tr("Select an item first."));
         return;
     }
 
     bool ok = false;
-    const int copies = QInputDialog::getInt(dialog, QObject::tr("Print DK-11204 label"),
+    const int copies = QInputDialog::getInt(dialog,
+                                            QObject::tr("Print DK-11204 label"),
                                             QObject::tr("Number of labels:"),
                                             1, 1, 250, 1, &ok);
     if (!ok)
         return;
 
-    QPrinter printer(QPrinter::HighResolution);
-    selectPreferredPrinter(printer);
-    printer.setFullPage(true);
-    printer.setPageSize(QPageSize(QSizeF(54.0, 17.0), QPageSize::Millimeter,
-                                  u"Brother DK-11204 17x54mm"_qs));
-
-    QPrintDialog printDialog(&printer, dialog);
-    printDialog.setWindowTitle(QObject::tr("Print DK-11204 label"));
-    if (printDialog.exec() != QDialog::Accepted)
-        return;
-
-    // Re-apply the target label after the native driver dialog. Some drivers reset
-    // custom page sizes while the dialog is open.
-    printer.setFullPage(true);
-    printer.setPageSize(QPageSize(QSizeF(54.0, 17.0), QPageSize::Millimeter,
-                                  u"Brother DK-11204 17x54mm"_qs));
-
-    Config::inst()->setValue(QString::fromLatin1(LabelPrinterConfigKey), printer.printerName());
-
-    const QString id = QString::fromLatin1(item->id());
-    const QString name = item->name();
-    const QString colorName = color ? color->name() : QObject::tr("No color");
     const QString condition = (usedRadio && usedRadio->isChecked())
             ? QObject::tr("Used") : QObject::tr("New");
-    const QString meta = colorName + u"  ·  "_qs + condition;
-    const QString price = u"%1 %2"_qs.arg(currencyCode(dialog),
-                                           QString::number(priceSpin->value(), 'f', 2));
 
-    QPainter painter;
-    if (!painter.begin(&printer)) {
-        QMessageBox::critical(dialog, QObject::tr("Print DK-11204 label"),
-                              QObject::tr("Could not start the printer."));
-        return;
-    }
+    QJsonObject payload;
+    payload.insert(u"item_id"_qs, QString::fromLatin1(item->id()));
+    payload.insert(u"name"_qs, item->name());
+    payload.insert(u"color"_qs, color ? color->name() : QObject::tr("No color"));
+    payload.insert(u"condition"_qs, condition);
+    payload.insert(u"currency"_qs, currencyCode(dialog));
+    payload.insert(u"price"_qs, priceSpin->value());
+    payload.insert(u"copies"_qs, copies);
 
-    painter.setRenderHint(QPainter::TextAntialiasing, true);
-    for (int copy = 0; copy < copies; ++copy) {
-        if (copy && !printer.newPage())
-            break;
-        drawLabel(painter, printer, id, name, meta, price);
-    }
-    painter.end();
+    const PrintResult result = postLabel(payload);
+    if (!result.ok)
+        showServiceError(dialog, result.error);
 }
 
 class BrickLabelIntegration final : public QObject
@@ -201,7 +212,7 @@ protected:
                     auto *button = new QPushButton(QObject::tr("Print DK-11204"), box);
                     button->setObjectName(u"w_print_dk11204"_qs);
                     button->setToolTip(QObject::tr(
-                        "Print the selected item, color, condition and current price on a 17 x 54 mm Brother DK-11204 label."));
+                        "Print through the local brother_ql service. This bypasses the Windows Brother printer driver."));
                     box->addButton(button, QDialogButtonBox::ActionRole);
                     QObject::connect(button, &QPushButton::clicked, dialog,
                                      [dialog]() { printLabel(dialog); });
