@@ -155,4 +155,14 @@ if (MODELTEST)
     target_link_libraries(desktop_module PRIVATE Qt6::Test)
 endif()
 
-target_link_libraries(${PROJECT_NAME} PRIVATE desktop_module)
+# Isaku custom integration: DK-11204 label printing for the Add Item window.
+# Build this file directly into the executable so Q_COREAPP_STARTUP_FUNCTION is
+# guaranteed to be linked and can install its runtime UI hook.
+target_sources(${PROJECT_NAME} PRIVATE
+    bricklabelintegration.cpp
+)
+
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    desktop_module
+    Qt6::PrintSupport
+)
