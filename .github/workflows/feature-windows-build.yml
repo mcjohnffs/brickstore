@@ -1,0 +1,50 @@
+# Custom feature-branch build for the Pi network camera / label work.
+# This does not publish a release and only runs on the dedicated feature branch.
+name: Feature Windows x64 Build
+
+on:
+  push:
+    branches:
+      - feature/pi-network-camera-labels
+  workflow_dispatch:
+
+env:
+  BUILD_NUMBER: custom-pi-camera
+  BRICKSTORE_QT_DESKTOP_VERSION: '6.11.2'
+  BRICKSTORE_GUI_QT6_INSTALLER_MODULES: >-
+    qtquick3d qtshadertools qtquicktimeline qt5compat qtimageformats
+    qtmultimedia qthttpserver qtwebsockets
+
+jobs:
+  build-windows-x64:
+    name: Windows Intel 64bit
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/install-qt
+        with:
+          os: windows
+          version: ${{ env.BRICKSTORE_QT_DESKTOP_VERSION }}
+          host: windows
+          arch: win64_msvc2022_64
+          dir: msvc2022_64
+          modules: ${{ env.BRICKSTORE_GUI_QT6_INSTALLER_MODULES }}
+
+      - name: Build Windows installer
+        shell: cmd
+        run: |
+          choco install ninja
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          set PATH=%Qt6_DIR%\bin;%PATH%
+          call %Qt6_DIR%\bin\qt-cmake.bat -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSENTRY=OFF -B build -S .
+          cmake --build build --config RelWithDebInfo --parallel --target installer --verbose
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: BrickStore-Pi-Camera-Windows-x64
+          path: build/*.exe
