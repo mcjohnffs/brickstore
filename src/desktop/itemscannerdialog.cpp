@@ -2,34 +2,47 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include <QButtonGroup>
-#include <QComboBox>
-#include <QLabel>
-#include <QProgressBar>
-#include <QToolButton>
-#include <QFormLayout>
-#include <QStackedLayout>
-#include <QVBoxLayout>
-#include <QKeyEvent>
-#include <QMediaDevices>
 #include <QCameraDevice>
+#include <QComboBox>
+#include <QFormLayout>
+#include <QKeyEvent>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMediaDevices>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
+#include <QPixmap>
+#include <QProgressBar>
+#include <QStackedLayout>
+#include <QTimer>
+#include <QToolButton>
+#include <QUrl>
+#include <QVBoxLayout>
 #include <QQmlApplicationEngine>
 
 #include "bricklink/core.h"
 #include "bricklink/item.h"
 #include <common/application.h>
 #include "common/config.h"
+#include "common/eventfilter.h"
 #include "scanner/core.h"
 #include "scanner/capture.h"
 #include "scanner/camerapreviewwidget.h"
 #include "itemscannerdialog.h"
 
-using namespace std::chrono_literals;
 
+QByteArray ItemScannerDialog::networkCameraId()
+{
+    return QByteArrayLiteral("__brickstore_network_camera__");
+}
 
 ItemScannerDialog::ItemScannerDialog(QWidget *parent)
     : QDialog(parent)
     , m_mediaDevices(new QMediaDevices(this))
     , m_capture(new Scanner::Capture(this))
+    , m_networkManager(new QNetworkAccessManager(this))
+    , m_networkPreviewTimer(new QTimer(this))
 {
     setSizeGripEnabled(true);
 
@@ -37,6 +50,17 @@ ItemScannerDialog::ItemScannerDialog(QWidget *parent)
     m_selectCamera->setFocusPolicy(Qt::NoFocus);
     connect(m_mediaDevices, &QMediaDevices::videoInputsChanged,
             this, &ItemScannerDialog::updateCameraDevices);
+
+    m_networkUrl = new QLineEdit(this);
+    m_networkUrl->setText(Config::inst()->value(
+        u"MainWindow/ItemScannerDialog/NetworkCameraUrl"_qs,
+        u"http://raspberrypi.local:8000"_qs).toString());
+    m_networkUrl->setPlaceholderText(u"http://192.168.1.123:8000"_qs);
+    connect(m_networkUrl, &QLineEdit::editingFinished, this, [this]() {
+        m_networkError.clear();
+        if (isNetworkCameraSelected())
+            requestNetworkPreview();
+    });
 
     m_selectBackend = new QComboBox(this);
     m_selectBackend->setFocusPolicy(Qt::NoFocus);
@@ -70,8 +94,26 @@ ItemScannerDialog::ItemScannerDialog(QWidget *parent)
     m_capture->setVideoOutput(m_cameraPreviewWidget->videoOutput());
     m_capture->trackWindowVisibility(this);
 
+    m_networkPreview = new QLabel(this);
+    m_networkPreview->setAlignment(Qt::AlignCenter);
+    m_networkPreview->setMinimumSize(m_cameraPreviewWidget->minimumSize());
+    m_networkPreview->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    m_networkPreview->setText(tr("Waiting for Raspberry Pi camera..."));
+
+    new EventFilter(m_networkPreview, { QEvent::MouseButtonRelease },
+                    [this](QObject *, QEvent *) {
+        captureAndScan();
+        return EventFilter::StopEventProcessing;
+    });
+
+    m_previewStack = new QStackedLayout();
+    m_previewStack->setContentsMargins(0, 0, 0, 0);
+    m_previewStack->addWidget(m_cameraPreviewWidget);
+    m_previewStack->addWidget(m_networkPreview);
+    m_previewStack->setCurrentWidget(m_cameraPreviewWidget);
+
     connect(m_cameraPreviewWidget, &Scanner::CameraPreviewWidget::clicked,
-            m_capture, &Scanner::Capture::captureAndScan);
+            this, &ItemScannerDialog::captureAndScan);
     connect(m_capture, &Scanner::Capture::cameraActiveChanged,
             m_cameraPreviewWidget, &Scanner::CameraPreviewWidget::setActive);
 
@@ -103,10 +145,11 @@ ItemScannerDialog::ItemScannerDialog(QWidget *parent)
     auto *layout = new QVBoxLayout(this);
     auto *form = new QFormLayout();
     form->addRow(m_labelCamera = new QLabel(this), m_selectCamera);
+    form->addRow(m_labelNetworkUrl = new QLabel(this), m_networkUrl);
     form->addRow(m_labelBackend = new QLabel(this), m_selectBackend);
     form->addRow(m_labelItemType = new QLabel(this), itemTypesWidget);
     layout->addLayout(form);
-    layout->addWidget(m_cameraPreviewWidget, 100);
+    layout->addLayout(m_previewStack, 100);
     m_bottomStack = new QStackedLayout();
     m_bottomStack->setContentsMargins(0, 0, 0, 0);
     m_bottomStack->addWidget(m_status);
@@ -115,8 +158,6 @@ ItemScannerDialog::ItemScannerDialog(QWidget *parent)
     bottomLayout->addWidget(m_pinWindow);
     bottomLayout->addLayout(m_bottomStack, 1);
     layout->addLayout(bottomLayout, 0);
-
-    updateCameraDevices();
 
     const QByteArrayList backendIds = Scanner::core()->availableBackendIds();
     for (const QByteArray &backendId : backendIds) {
@@ -128,7 +169,7 @@ ItemScannerDialog::ItemScannerDialog(QWidget *parent)
     connect(m_selectCamera, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int index) {
         if (index >= 0)
-            m_capture->setCurrentCameraId(m_selectCamera->itemData(index).toByteArray());
+            cameraSelectionChanged();
     });
     m_selectBackend->setCurrentIndex(-1);
     connect(m_selectBackend, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -141,25 +182,69 @@ ItemScannerDialog::ItemScannerDialog(QWidget *parent)
         m_capture->setCurrentItemTypeFilter(BrickLink::core()->itemType(char(id)));
     });
 
-    //TODO: move default ids to Capture?
-    const QByteArray cameraId = Config::inst()->value(u"MainWindow/ItemScannerDialog/CameraId"_qs).toByteArray();
-    int cameraIndex = m_selectCamera->findData(cameraId);
-    m_selectCamera->setCurrentIndex(cameraIndex < 0 ? 0 : cameraIndex);
+    m_networkPreviewTimer->setInterval(500);
+    connect(m_networkPreviewTimer, &QTimer::timeout,
+            this, &ItemScannerDialog::requestNetworkPreview);
 
-    const QByteArray backendId = Config::inst()->value(u"MainWindow/ItemScannerDialog/BackendId"_qs).toByteArray();
+    connect(Scanner::core(), &Scanner::Core::scanFinished,
+            this, [this](uint scanId, const QVector<Scanner::Core::Result> &itemsAndScores) {
+        if (!m_networkScanId || scanId != m_networkScanId)
+            return;
+
+        m_networkScanId = 0;
+        QVector<const BrickLink::Item *> items;
+        items.reserve(itemsAndScores.size());
+        for (const auto &result : itemsAndScores)
+            items << result.item;
+
+        if (items.isEmpty()) {
+            m_networkError = tr("No matching item found - try again.");
+            updateStatusText();
+            return;
+        }
+
+        m_networkError.clear();
+        updateStatusText();
+        emit itemsScanned(items);
+        if (!m_pinWindow->isChecked())
+            accept();
+    });
+    connect(Scanner::core(), &Scanner::Core::scanFailed,
+            this, [this](uint scanId, const QString &error) {
+        if (!m_networkScanId || scanId != m_networkScanId)
+            return;
+        m_networkScanId = 0;
+        m_networkError = error;
+        updateStatusText();
+    });
+
+    updateCameraDevices();
+
+    const QByteArray cameraId = Config::inst()->value(
+        u"MainWindow/ItemScannerDialog/CameraId"_qs).toByteArray();
+    int cameraIndex = m_selectCamera->findData(cameraId);
+    if (cameraIndex < 0)
+        cameraIndex = 0;
+    m_selectCamera->setCurrentIndex(cameraIndex);
+    cameraSelectionChanged();
+
+    const QByteArray backendId = Config::inst()->value(
+        u"MainWindow/ItemScannerDialog/BackendId"_qs).toByteArray();
     int backendIndex = m_selectBackend->findData(backendId);
     m_selectBackend->setCurrentIndex(backendIndex < 0 ? 0 : backendIndex);
 
     languageChange();
 
-    restoreGeometry(Config::inst()->value(u"MainWindow/ItemScannerDialog/Geometry"_qs).toByteArray());
+    restoreGeometry(Config::inst()->value(
+        u"MainWindow/ItemScannerDialog/Geometry"_qs).toByteArray());
 
     // QtMM bug: the camera preview is most likely just black without this
     QMetaObject::invokeMethod(this, [this]() {
           m_cameraPreviewWidget->resize(m_cameraPreviewWidget->size() + QSize(1, 1));
         }, Qt::QueuedConnection);
 
-    m_pinWindow->setChecked(Config::inst()->value(u"MainWindow/ItemScannerDialog/Pinned"_qs, false).toBool());
+    m_pinWindow->setChecked(Config::inst()->value(
+        u"MainWindow/ItemScannerDialog/Pinned"_qs, false).toBool());
 
     updateItemTypeFilters();
     connect(m_capture, &Scanner::Capture::supportedItemTypeFiltersChanged,
@@ -187,20 +272,193 @@ ItemScannerDialog::ItemScannerDialog(QWidget *parent)
 
 ItemScannerDialog::~ItemScannerDialog()
 {
+    if (m_previewReply)
+        m_previewReply->abort();
+    if (m_scanReply)
+        m_scanReply->abort();
+
     Config::inst()->setValue(u"MainWindow/ItemScannerDialog/Geometry"_qs, saveGeometry());
-    Config::inst()->setValue(u"MainWindow/ItemScannerDialog/CameraId"_qs, m_selectCamera->currentData().toByteArray());
-    Config::inst()->setValue(u"MainWindow/ItemScannerDialog/BackendId"_qs, m_selectBackend->currentData().toByteArray());
-    Config::inst()->setValue(u"MainWindow/ItemScannerDialog/Pinned"_qs, m_pinWindow->isChecked());
+    Config::inst()->setValue(u"MainWindow/ItemScannerDialog/CameraId"_qs,
+                             m_selectCamera->currentData().toByteArray());
+    Config::inst()->setValue(u"MainWindow/ItemScannerDialog/NetworkCameraUrl"_qs,
+                             m_networkUrl->text().trimmed());
+    Config::inst()->setValue(u"MainWindow/ItemScannerDialog/BackendId"_qs,
+                             m_selectBackend->currentData().toByteArray());
+    Config::inst()->setValue(u"MainWindow/ItemScannerDialog/Pinned"_qs,
+                             m_pinWindow->isChecked());
 }
 
-void ItemScannerDialog::checkSystemPermissions(QObject *context, const std::function<void(bool)> &callback)
+void ItemScannerDialog::checkSystemPermissions(QObject *context,
+                                                const std::function<void(bool)> &callback)
 {
+    if (Config::inst()->value(u"MainWindow/ItemScannerDialog/CameraId"_qs).toByteArray()
+            == networkCameraId()) {
+        if (callback)
+            callback(true);
+        return;
+    }
     Scanner::Capture::checkSystemPermissions(context, callback);
 }
 
 void ItemScannerDialog::setItemType(const BrickLink::ItemType *itemType)
 {
     m_capture->setCurrentItemTypeFilter(itemType);
+}
+
+bool ItemScannerDialog::isNetworkCameraSelected() const
+{
+    return m_selectCamera->currentData().toByteArray() == networkCameraId();
+}
+
+QString ItemScannerDialog::networkBaseUrl() const
+{
+    QString url = m_networkUrl->text().trimmed();
+    while (url.endsWith(u'/'))
+        url.chop(1);
+    if (!url.isEmpty() && !url.contains(u"://"_qs))
+        url.prepend(u"http://"_qs);
+    return url;
+}
+
+void ItemScannerDialog::cameraSelectionChanged()
+{
+    const bool network = isNetworkCameraSelected();
+    m_labelNetworkUrl->setVisible(network);
+    m_networkUrl->setVisible(network);
+
+    if (network) {
+        m_capture->setCurrentCameraId({ });
+        m_previewStack->setCurrentWidget(m_networkPreview);
+        m_networkError.clear();
+        m_networkPreviewTimer->start();
+        requestNetworkPreview();
+    } else {
+        m_networkPreviewTimer->stop();
+        if (m_previewReply) {
+            m_previewReply->abort();
+            m_previewReply = nullptr;
+        }
+        if (m_scanReply) {
+            m_scanReply->abort();
+            m_scanReply = nullptr;
+        }
+        m_networkScanId = 0;
+        m_networkError.clear();
+        m_previewStack->setCurrentWidget(m_cameraPreviewWidget);
+        m_capture->setCurrentCameraId(m_selectCamera->currentData().toByteArray());
+    }
+    updateStatusText();
+}
+
+void ItemScannerDialog::requestNetworkPreview()
+{
+    if (!isNetworkCameraSelected() || m_previewReply)
+        return;
+
+    const QString baseUrl = networkBaseUrl();
+    if (baseUrl.isEmpty())
+        return;
+
+    QNetworkRequest request { QUrl(baseUrl + u"/snapshot.jpg"_qs) };
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"),
+                         QByteArrayLiteral("no-cache, no-store"));
+    m_previewReply = m_networkManager->get(request);
+    QNetworkReply *reply = m_previewReply;
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (m_previewReply == reply)
+            m_previewReply = nullptr;
+
+        if (reply->error() == QNetworkReply::NoError) {
+            QImage image;
+            if (image.loadFromData(reply->readAll())) {
+                m_lastNetworkImage = image;
+                const QSize targetSize = m_networkPreview->size().boundedTo(image.size());
+                m_networkPreview->setPixmap(QPixmap::fromImage(image).scaled(
+                    targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+                if (!m_networkScanId)
+                    m_networkError.clear();
+            } else if (!m_networkScanId) {
+                m_networkError = tr("The network camera returned an invalid image.");
+            }
+        } else if (reply->error() != QNetworkReply::OperationCanceledError && !m_networkScanId) {
+            m_networkError = tr("Network camera error: %1").arg(reply->errorString());
+        }
+
+        reply->deleteLater();
+        updateStatusText();
+    });
+}
+
+void ItemScannerDialog::captureAndScan()
+{
+    if (isNetworkCameraSelected())
+        captureNetworkAndScan();
+    else
+        m_capture->captureAndScan();
+}
+
+void ItemScannerDialog::captureNetworkAndScan()
+{
+    if (m_scanReply || m_networkScanId)
+        return;
+
+    const QString baseUrl = networkBaseUrl();
+    if (baseUrl.isEmpty()) {
+        m_networkError = tr("Enter the Raspberry Pi camera URL first.");
+        updateStatusText();
+        return;
+    }
+
+    m_networkError.clear();
+    m_status->setText(tr("Capturing network camera..."));
+    m_bottomStack->setCurrentWidget(m_status);
+
+    QNetworkRequest request { QUrl(baseUrl + u"/snapshot.jpg"_qs) };
+    request.setRawHeader(QByteArrayLiteral("Cache-Control"),
+                         QByteArrayLiteral("no-cache, no-store"));
+    m_scanReply = m_networkManager->get(request);
+    QNetworkReply *reply = m_scanReply;
+
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        if (m_scanReply == reply)
+            m_scanReply = nullptr;
+
+        if (reply->error() == QNetworkReply::NoError) {
+            QImage image;
+            if (image.loadFromData(reply->readAll())) {
+                m_lastNetworkImage = image;
+                reply->deleteLater();
+                startNetworkScan(image);
+                return;
+            }
+            m_networkError = tr("The network camera returned an invalid image.");
+        } else if (reply->error() != QNetworkReply::OperationCanceledError) {
+            m_networkError = tr("Network camera error: %1").arg(reply->errorString());
+        }
+
+        reply->deleteLater();
+        updateStatusText();
+    });
+}
+
+void ItemScannerDialog::startNetworkScan(const QImage &image)
+{
+    if (image.isNull()) {
+        m_networkError = tr("There is no network camera image to scan.");
+        updateStatusText();
+        return;
+    }
+
+    m_status->setText(tr("Scanning..."));
+    m_bottomStack->setCurrentWidget(m_status);
+    m_networkScanId = Scanner::core()->scan(image,
+                                             m_capture->currentItemTypeFilter(),
+                                             m_capture->currentBackendId());
+    if (!m_networkScanId) {
+        m_networkError = tr("Scanning failed");
+        updateStatusText();
+    }
 }
 
 void ItemScannerDialog::updateCameraDevices()
@@ -223,13 +481,18 @@ void ItemScannerDialog::updateCameraDevices()
             if (cameraDevice.id() == oldCameraId)
                 newCurrentIndex = m_selectCamera->count() - 1;
         }
-        if ((newCurrentIndex < 0) && !allCameraDevices.isEmpty())
-            newCurrentIndex = 0;
+
+        m_selectCamera->addItem(camIcon, tr("Raspberry Pi / Network Camera"), networkCameraId());
+        if (oldCameraId == networkCameraId())
+            newCurrentIndex = m_selectCamera->count() - 1;
+
+        if (newCurrentIndex < 0)
+            newCurrentIndex = allCameraDevices.isEmpty() ? m_selectCamera->count() - 1 : 0;
         m_selectCamera->setCurrentIndex(newCurrentIndex);
     }
-    m_capture->setCurrentCameraId(m_selectCamera->currentData().toByteArray());
 
-    setEnabled(!allCameraDevices.isEmpty());
+    cameraSelectionChanged();
+    setEnabled(true);
     updateStatusText();
 }
 
@@ -267,7 +530,7 @@ void ItemScannerDialog::changeEvent(QEvent *e)
 void ItemScannerDialog::keyPressEvent(QKeyEvent *e)
 {
     if (e->key() == Qt::Key_Space)
-        m_capture->captureAndScan();
+        captureAndScan();
     QDialog::keyPressEvent(e);
 }
 
@@ -277,6 +540,7 @@ void ItemScannerDialog::languageChange()
     updateStatusText();
 
     m_labelCamera->setText(tr("Camera"));
+    m_labelNetworkUrl->setText(tr("Pi camera URL"));
     m_labelBackend->setText(tr("Service"));
     m_labelItemType->setText(tr("Item type"));
 
@@ -285,6 +549,22 @@ void ItemScannerDialog::languageChange()
 
 void ItemScannerDialog::updateStatusText()
 {
+    if (isNetworkCameraSelected()) {
+        m_bottomStack->setCurrentWidget(m_status);
+        if (m_networkScanId) {
+            m_status->setText(tr("Scanning..."));
+        } else if (m_scanReply) {
+            m_status->setText(tr("Capturing network camera..."));
+        } else if (!m_networkError.isEmpty()) {
+            m_status->setText(u"<b>"_qs + m_networkError.toHtmlEscaped() + u"</b>"_qs);
+        } else if (m_lastNetworkImage.isNull()) {
+            m_status->setText(tr("Connecting to the Raspberry Pi camera..."));
+        } else {
+            m_status->setText(tr("Click into the camera preview or press Space to capture an image."));
+        }
+        return;
+    }
+
     switch (m_capture->state()) {
     case Scanner::Capture::State::Idle:
         if (m_selectCamera->count())
