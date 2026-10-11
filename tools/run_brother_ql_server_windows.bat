@@ -2,8 +2,8 @@
 setlocal
 cd /d "%~dp0.."
 
-echo BrickStore Brother QL-810W label service
-echo =========================================
+echo BrickStore Brother QL-810W label service v2
+echo ============================================
 
 echo This window MUST stay open while printing from BrickStore.
 echo BrickStore talks to http://127.0.0.1:8013
@@ -43,12 +43,13 @@ echo Printer      : tcp://%BROTHER_QL_IP%
 echo Backend      : network
 echo Model        : QL-810W
 echo Label        : DK-11204 / 17x54
+echo Service      : v2 ^(index + configurable layout + price rounding^)
 echo.
-echo When you see "Brother QL service listening", test:
+echo When you see "Brother QL service v2 listening", test:
 echo     http://127.0.0.1:8013/health
 echo.
 
-"%VENV%\Scripts\python.exe" "%~dp0brickstore_brother_ql_server.py" --printer "tcp://%BROTHER_QL_IP%" --backend network --model QL-810W --host 127.0.0.1 --port 8013 --log-level DEBUG
+"%VENV%\Scripts\python.exe" "%~dp0brickstore_brother_ql_server_v2.py" --printer "tcp://%BROTHER_QL_IP%" --backend network --model QL-810W --host 127.0.0.1 --port 8013 --log-level DEBUG
 set "RC=%ERRORLEVEL%"
 
 echo.
