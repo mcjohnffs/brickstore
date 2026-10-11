@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """BrickStore DK-11204 print service using brother_ql.
 
-This deliberately mirrors the user's proven working Brother QL code path:
+This deliberately mirrors the proven Brother QL code path:
     BrotherQLRaster -> brother_ql.conversion.convert -> brother_ql.backends.helpers.send
 
-It bypasses the Windows printer driver completely.
+It bypasses the Windows printer driver completely. BrickStore supplies label
+content plus optional layout/rounding settings in JSON.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import argparse
 import json
 import logging
 import os
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -24,9 +26,59 @@ from brother_ql.raster import BrotherQLRaster
 
 LOG = logging.getLogger("brickstore-brother-ql")
 LABEL_ID = "17x54"          # Brother DK-11204
-LABEL_PIXELS = (566, 165)   # landscape; convert(... rotate='auto') rotates for the die-cut label
+LABEL_PIXELS = (566, 165)   # landscape; convert(... rotate='auto') rotates for die-cut media
 DEFAULT_MODEL = "QL-810W"
 DEFAULT_BACKEND = "network"
+
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "show_item_id": True,
+    "show_name": True,
+    "show_color": True,
+    "show_condition": True,
+    "show_price": True,
+    "show_currency": True,
+    "show_quantity": False,
+    "show_remarks": False,
+    "show_comments": False,
+    "show_separator": True,
+    "font_item_id": 39,
+    "font_price": 39,
+    "font_name": 29,
+    "font_meta": 24,
+    "font_extra": 19,
+    "bold_item_id": True,
+    "bold_price": True,
+    "bold_name": False,
+    "bold_meta": False,
+    "bold_extra": False,
+    "y_item_id": 4,
+    "y_price": 4,
+    "y_name": 57,
+    "y_meta": 105,
+    "y_extra": 132,
+    "y_separator": 158,
+    "margin_left": 12,
+    "margin_right": 12,
+    "top_split": 275,
+    "separator_width": 2,
+    "rounding_mode": "none",       # none | nearest | up | down
+    "rounding_step": 0.05,
+    "price_decimals": 2,
+    "currency_before": True,
+    "threshold": 70.0,
+    "dither": False,
+    "hq": True,
+    "cut": True,
+}
+
+
+def merged_settings(incoming: Any) -> dict[str, Any]:
+    result = dict(DEFAULT_SETTINGS)
+    if isinstance(incoming, dict):
+        for key in result:
+            if key in incoming:
+                result[key] = incoming[key]
+    return result
 
 
 def _font_candidates(bold: bool) -> list[str]:
@@ -43,6 +95,7 @@ def _font_candidates(bold: bool) -> list[str]:
 
 
 def load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    size = max(6, min(int(size), 100))
     for candidate in _font_candidates(bold):
         if Path(candidate).is_file():
             try:
@@ -56,7 +109,8 @@ def load_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
 
 
 def fit_font(draw: ImageDraw.ImageDraw, text: str, max_width: int,
-             start_size: int, min_size: int, bold: bool = False) -> ImageFont.ImageFont:
+             start_size: int, min_size: int = 6, bold: bool = False) -> ImageFont.ImageFont:
+    start_size = max(min_size, min(int(start_size), 100))
     for size in range(start_size, min_size - 1, -1):
         font = load_font(size, bold)
         box = draw.textbbox((0, 0), text, font=font)
@@ -65,37 +119,122 @@ def fit_font(draw: ImageDraw.ImageDraw, text: str, max_width: int,
     return load_font(min_size, bold)
 
 
-def render_label(data: dict[str, Any]) -> Image.Image:
+def _bool(settings: dict[str, Any], key: str) -> bool:
+    return bool(settings.get(key, DEFAULT_SETTINGS[key]))
+
+
+def _int(settings: dict[str, Any], key: str, minimum: int, maximum: int) -> int:
+    try:
+        value = int(settings.get(key, DEFAULT_SETTINGS[key]))
+    except (TypeError, ValueError):
+        value = int(DEFAULT_SETTINGS[key])
+    return max(minimum, min(value, maximum))
+
+
+def round_price(value: float, settings: dict[str, Any]) -> Decimal:
+    price = Decimal(str(value))
+    mode = str(settings.get("rounding_mode", "none")).lower()
+    try:
+        step = Decimal(str(settings.get("rounding_step", 0.05)))
+    except Exception:
+        step = Decimal("0.05")
+    if step <= 0 or mode == "none":
+        return price
+
+    quotient = price / step
+    if mode == "up":
+        rounded_units = quotient.to_integral_value(rounding=ROUND_CEILING)
+    elif mode == "down":
+        rounded_units = quotient.to_integral_value(rounding=ROUND_FLOOR)
+    else:
+        rounded_units = quotient.to_integral_value(rounding=ROUND_HALF_UP)
+    return rounded_units * step
+
+
+def format_price(data: dict[str, Any], settings: dict[str, Any]) -> str:
+    try:
+        raw = float(data.get("price", 0.0))
+    except (TypeError, ValueError):
+        raw = 0.0
+    rounded = round_price(raw, settings)
+    decimals = _int(settings, "price_decimals", 0, 4)
+    number = f"{rounded:.{decimals}f}"
+    if not _bool(settings, "show_currency"):
+        return number
+    currency = str(data.get("currency", "CHF")).strip() or "CHF"
+    if _bool(settings, "currency_before"):
+        return f"{currency} {number}"
+    return f"{number} {currency}"
+
+
+def render_label(data: dict[str, Any], settings_in: Any = None) -> Image.Image:
+    settings = merged_settings(settings_in)
     item_id = str(data.get("item_id", "")).strip()
     name = str(data.get("name", "")).strip()
     color = str(data.get("color", "No color")).strip()
     condition = str(data.get("condition", "New")).strip()
-    currency = str(data.get("currency", "CHF")).strip() or "CHF"
-    try:
-        price_value = float(data.get("price", 0.0))
-    except (TypeError, ValueError):
-        price_value = 0.0
-
-    price = f"{currency} {price_value:.2f}"
-    meta = f"{color}  ·  {condition}"
+    remarks = str(data.get("remarks", "")).strip()
+    comments = str(data.get("comments", "")).strip()
+    quantity = data.get("quantity", "")
 
     image = Image.new("RGB", LABEL_PIXELS, "white")
     draw = ImageDraw.Draw(image)
-    left = 12
-    right = LABEL_PIXELS[0] - 12
+    left = _int(settings, "margin_left", 0, 100)
+    right = LABEL_PIXELS[0] - _int(settings, "margin_right", 0, 100)
+    split = _int(settings, "top_split", left + 40, right - 40)
 
-    id_font = fit_font(draw, item_id, 250, 39, 26, bold=True)
-    price_font = fit_font(draw, price, 270, 39, 25, bold=True)
-    name_font = fit_font(draw, name, right - left, 29, 19)
-    meta_font = fit_font(draw, meta, right - left, 24, 17)
+    if _bool(settings, "show_item_id") and item_id:
+        font = fit_font(draw, item_id, max(20, split - left - 5),
+                        _int(settings, "font_item_id", 6, 100), 6,
+                        _bool(settings, "bold_item_id"))
+        draw.text((left, _int(settings, "y_item_id", 0, 164)), item_id, fill="black", font=font)
 
-    draw.text((left, 4), item_id, fill="black", font=id_font)
-    price_box = draw.textbbox((0, 0), price, font=price_font)
-    price_width = price_box[2] - price_box[0]
-    draw.text((right - price_width, 4), price, fill="black", font=price_font)
-    draw.text((left, 57), name, fill="black", font=name_font)
-    draw.text((left, 105), meta, fill="black", font=meta_font)
-    draw.line((left, 154, right, 154), fill="black", width=2)
+    if _bool(settings, "show_price"):
+        price = format_price(data, settings)
+        font = fit_font(draw, price, max(20, right - split - 5),
+                        _int(settings, "font_price", 6, 100), 6,
+                        _bool(settings, "bold_price"))
+        box = draw.textbbox((0, 0), price, font=font)
+        draw.text((right - (box[2] - box[0]), _int(settings, "y_price", 0, 164)),
+                  price, fill="black", font=font)
+
+    if _bool(settings, "show_name") and name:
+        font = fit_font(draw, name, max(20, right - left),
+                        _int(settings, "font_name", 6, 100), 6,
+                        _bool(settings, "bold_name"))
+        draw.text((left, _int(settings, "y_name", 0, 164)), name, fill="black", font=font)
+
+    meta_parts: list[str] = []
+    if _bool(settings, "show_color") and color:
+        meta_parts.append(color)
+    if _bool(settings, "show_condition") and condition:
+        meta_parts.append(condition)
+    meta = "  ·  ".join(meta_parts)
+    if meta:
+        font = fit_font(draw, meta, max(20, right - left),
+                        _int(settings, "font_meta", 6, 100), 6,
+                        _bool(settings, "bold_meta"))
+        draw.text((left, _int(settings, "y_meta", 0, 164)), meta, fill="black", font=font)
+
+    extra_parts: list[str] = []
+    if _bool(settings, "show_quantity") and quantity not in (None, ""):
+        extra_parts.append(f"Qty {quantity}")
+    if _bool(settings, "show_remarks") and remarks:
+        extra_parts.append(remarks)
+    if _bool(settings, "show_comments") and comments:
+        extra_parts.append(comments)
+    extra = "  ·  ".join(extra_parts)
+    if extra:
+        font = fit_font(draw, extra, max(20, right - left),
+                        _int(settings, "font_extra", 6, 100), 6,
+                        _bool(settings, "bold_extra"))
+        draw.text((left, _int(settings, "y_extra", 0, 164)), extra, fill="black", font=font)
+
+    if _bool(settings, "show_separator"):
+        y = _int(settings, "y_separator", 0, 164)
+        width = _int(settings, "separator_width", 1, 8)
+        draw.line((left, y, right, y), fill="black", width=width)
+
     return image
 
 
@@ -106,11 +245,12 @@ class LabelPrinter:
         self.backend = backend
         self.dry_run = dry_run
 
-    def print_labels(self, label_payloads: list[dict[str, Any]]) -> int:
+    def print_labels(self, label_payloads: list[dict[str, Any]], settings: Any = None) -> int:
+        settings = merged_settings(settings)
         images: list[Image.Image] = []
         for payload in label_payloads:
             copies = max(1, min(int(payload.get("copies", 1)), 250))
-            image = render_label(payload)
+            image = render_label(payload, settings)
             images.extend([image.copy() for _ in range(copies)])
 
         if not images:
@@ -129,13 +269,13 @@ class LabelPrinter:
             images=images,
             label=LABEL_ID,
             rotate="auto",
-            threshold=70.0,
-            dither=False,
+            threshold=float(settings.get("threshold", 70.0)),
+            dither=_bool(settings, "dither"),
             compress=False,
             red=False,
             dpi_600=False,
-            hq=True,
-            cut=True,
+            hq=_bool(settings, "hq"),
+            cut=_bool(settings, "cut"),
         )
         send(
             instructions=instructions,
@@ -147,7 +287,7 @@ class LabelPrinter:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BrickStoreBrotherQL/1.1"
+    server_version = "BrickStoreBrotherQL/1.2"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("%s - %s", self.address_string(), fmt % args)
@@ -185,6 +325,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("JSON body must be an object")
 
+            settings = payload.get("settings", {})
             if isinstance(payload.get("labels"), list):
                 labels = [entry for entry in payload["labels"] if isinstance(entry, dict)]
             else:
@@ -196,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not str(entry.get("item_id", "")).strip():
                     raise ValueError("item_id is required for every label")
 
-            printed = self.server.label_printer.print_labels(labels)
+            printed = self.server.label_printer.print_labels(labels, settings)
             self._json(200, {"ok": True, "printed": printed, "label": LABEL_ID})
         except Exception as exc:
             LOG.exception("Printing failed")
