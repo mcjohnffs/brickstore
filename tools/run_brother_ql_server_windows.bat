@@ -26,17 +26,20 @@ if errorlevel 1 (
 )
 
 if "%BROTHER_QL_IP%"=="" (
-    set /p BROTHER_QL_IP=Enter the QL-810W IP address: 
+    set /p BROTHER_QL_IP=Enter the QL-810W IP address [192.168.1.7]: 
 )
-if "%BROTHER_QL_IP%"=="" goto :fail
+if "%BROTHER_QL_IP%"=="" set "BROTHER_QL_IP=192.168.1.7"
 
 echo.
 echo Starting service at http://127.0.0.1:8013
-echo Printer: tcp://%BROTHER_QL_IP%:9100
+echo Printer: tcp://%BROTHER_QL_IP%
+echo Backend: network
+echo Model: QL-810W
+echo Label: DK-11204 / 17x54
 echo Keep this window open while printing from BrickStore.
 echo.
 
-"%VENV%\Scripts\python.exe" "%~dp0brickstore_brother_ql_server.py" --printer "tcp://%BROTHER_QL_IP%:9100" --model QL-810W --host 127.0.0.1 --port 8013
+"%VENV%\Scripts\python.exe" "%~dp0brickstore_brother_ql_server.py" --printer "tcp://%BROTHER_QL_IP%" --backend network --model QL-810W --host 127.0.0.1 --port 8013
 exit /b %errorlevel%
 
 :fail
