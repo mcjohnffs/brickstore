@@ -155,12 +155,13 @@ if (MODELTEST)
     target_link_libraries(desktop_module PRIVATE Qt6::Test)
 endif()
 
-# Isaku custom integrations: DK-11204 label printing plus compatibility fixes.
-# Build directly into the executable so Q_COREAPP_STARTUP_FUNCTION is guaranteed
-# to be linked and can install the runtime UI hooks.
+# Isaku custom integrations: DK-11204 label printing, compatibility fixes,
+# and exact renderer preview. Build directly into the executable so
+# Q_COREAPP_STARTUP_FUNCTION hooks are guaranteed to be linked.
 target_sources(${PROJECT_NAME} PRIVATE
     bricklabelintegration.cpp
     bricklabelfixes.cpp
+    bricklabelpreview.cpp
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
